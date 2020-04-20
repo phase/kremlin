@@ -6,7 +6,6 @@
 
 open Ast
 open DeBruijn
-open Idents
 open Warn
 open PrintAst.Ops
 open Helpers
@@ -96,8 +95,15 @@ let ignore_non_first_order = object (self)
 
   method! visit_EApp env e es =
     List.iter (self#visit_expr env) es;
+    let parameter_table, _ = env in
+    let _, ts = Helpers.flatten_arrow e.typ in
     match e.node with
-    | EQualified _ -> ()
+    | EQualified lid ->
+        (* partial applications are not first-order... may be overly
+         * conservative with higher-order code that really means to return a
+         * function pointer but that's not the end of the world *)
+        if List.length es <> List.length ts then
+          Hashtbl.remove parameter_table lid
     | _ -> self#visit_expr env e
 
   method! visit_EQualified (parameter_table, _) lid =
@@ -1067,29 +1073,6 @@ end
 
 (* Make top-level names C-compatible using a global translation table **********)
 
-let skip_prefix prefix =
-  List.exists (fun p -> Bundle.pattern_matches p (String.concat "_" prefix)) !Options.no_prefix
-
-(* Because of dedicated treatment in CStarToC11 *)
-let ineligible lident =
-  List.mem (fst lident) [
-    ["FStar"; "UInt128"];
-    ["C"; "Nullity"];
-    ["C"; "String"];
-    ["C"; "Compat"; "String"];
-    ["LowStar"; "BufferOps"];
-    ["LowStar"; "Buffer"];
-    ["LowStar"; "Monotonic"; "Buffer"]
-  ]
-
-let target_c_name lident is_private_scope =
-  if skip_prefix (fst lident) && not (ineligible lident) then
-    snd lident
-  else if is_private_scope && not (ineligible lident) && snd lident <> "main" then
-    snd lident
-  else
-    string_of_lident lident
-
 (* A reverse map whose domain is all the top-level declarations that end up
  * in a .h file. Notably, private functions are absent from the map. *)
 let original_of_c_name: (ident, lident) Hashtbl.t = Hashtbl.create 43
@@ -1103,18 +1086,14 @@ class scope_helpers = object (self)
     List.mem Common.Private flags && not (Helpers.is_static_header lident)
 
   method private record (global_scope, local_scopes) is_external flags lident =
+    let is_macro = List.mem Common.Macro flags in
     let is_private = self#is_private_scope flags lident in
     let local_scope = Hashtbl.find local_scopes current_file in
     let attempt_shortening = is_private && not is_external in
-    let target = target_c_name lident attempt_shortening in
+    let target = GlobalNames.target_c_name ~attempt_shortening ~is_macro lident in
     let c_name = GlobalNames.extend global_scope local_scope is_private lident target in
-    if not (self#is_private_scope flags lident) then
+    if not is_private then
       Hashtbl.add original_of_c_name c_name lident
-
-  method private recall (global_scope, _) lident =
-    match GlobalNames.lookup global_scope lident with
-    | Some name -> [], name
-    | None -> [], to_c_identifier (target_c_name lident false)
 end
 
 let record_toplevel_names = object (self)
@@ -1147,21 +1126,6 @@ let record_toplevel_names = object (self)
     | Enum lids -> List.iter (self#record env false flags) lids
     | Forward -> Hashtbl.add forward name ()
     | _ -> ()
-end
-
-(* Has to be done in two passes, because of mutual recursion. *)
-
-let replace_references_to_toplevel_names env = object (self)
-  inherit scope_helpers
-  inherit [_] map as super
-
-  (* Every file gets a fresh local scope. This is after bundling. *)
-  method! visit_file (env: scope_env) f =
-    current_file <- fst f;
-    super#visit_file env f
-
-  method! visit_lident _ lident =
-    self#recall env lident
 end
 
 
@@ -1480,11 +1444,12 @@ let combinators = object(self)
     in
 
     match e.node, es with
-    | EQualified ("C" :: (["Loops"]|["Compat";"Loops"]), "for_"), [ start; finish; _inv; { node = EFun (_, body, _); _ } ] ->
-        self#mk_for start finish body K.UInt32
-
     | EQualified ("C" :: (["Loops"]|["Compat";"Loops"]), "for64"), [ start; finish; _inv; { node = EFun (_, body, _); _ } ] ->
         self#mk_for start finish body K.UInt64
+
+    | EQualified ("C" :: (["Loops"]|["Compat";"Loops"]), s), [ start; finish; _inv; { node = EFun (_, body, _); _ } ]
+      when KString.starts_with s "for" ->
+        self#mk_for start finish body K.UInt32
 
     | EQualified ("C" :: (["Loops"]|["Compat";"Loops"]), s), [ _measure; _inv; tcontinue; body; init ]
         when KString.starts_with s "total_while_gen"
@@ -1627,20 +1592,19 @@ let remove_unused (files: file list): file list =
 let debug env =
   KPrint.bprintf "Global scope:\n";
   GlobalNames.dump (fst env);
-  KPrint.bprintf "\n";
+  KPrint.bprintf "\n\n";
   Hashtbl.iter (fun f s ->
     KPrint.bprintf "%s scope:\n" f;
     GlobalNames.dump s;
-    KPrint.bprintf "\n"
-  ) (snd env)
+    KPrint.bprintf "\n\n"
+  ) (snd env);
+  KPrint.bprintf "Reverse-map:\n";
+  Hashtbl.iter (fun c_name original ->
+    KPrint.bprintf "C name %s was %a\n" c_name plid original
+  ) original_of_c_name
 
-(* Allocate C names avoiding keywords and name collisions. This should be done
- * as the last operations, otherwise, any table for memoization suddenly becomes
- * invalid. *)
-let to_c_names (files: file list): file list * (ident, lident) Hashtbl.t =
+(* Allocate C names avoiding keywords and name collisions. *)
+let allocate_c_names (files: file list): (lident, ident) Hashtbl.t =
   let env = GlobalNames.create (), Hashtbl.create 41 in
   record_toplevel_names#visit_files env files;
-
-  let files = (replace_references_to_toplevel_names env)#visit_files env files in
-  files, original_of_c_name
-
+  GlobalNames.mapping (fst env)

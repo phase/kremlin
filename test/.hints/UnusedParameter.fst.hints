@@ -7,11 +7,12 @@
       2,
       1,
       [
-        "@query", "assumption_FStar.Int64.t__uu___haseq",
-        "haseqFStar.List.Tot.Base_Tm_refine_9f8cb5a84b67f50c9d5f87a914037545"
+        "@MaxIFuel_assumption", "@query", "equation_Prims.eqtype",
+        "refinement_interpretation_Tm_refine_414d0a9f578ab0048252f8c8f552b99f",
+        "typing_FStar.Int64.t"
       ],
       0,
-      "946f4927044c5f36940839bc48c5bef4"
+      "9ba85fe7b84e73057f20f94e50a482db"
     ],
     [
       "UnusedParameter.touch",
@@ -32,7 +33,7 @@
         "typing_FStar.Monotonic.HyperStack.get_hmap"
       ],
       0,
-      "6b67259e01b27e23c6e00d06669d5240"
+      "4dd9b2b6f04cc78fb24a89f8988bf562"
     ]
   ]
 ]

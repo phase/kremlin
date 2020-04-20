@@ -47,6 +47,7 @@ type env = {
      *     StringLiteral. The strings are shared in memory at compile-time, and
      *     hashconsing in CFlatToWasm guarantees that they are shared in the
      *     resulting code, too. *)
+  names: (lident, ident) Hashtbl.t;
 }
 
 and layout =
@@ -65,24 +66,25 @@ and flat_layout = {
 and offset = int
   (** In byte *)
 
-let empty = {
+let empty names = {
   binders = [];
   enums = LidMap.empty;
   layouts = LidMap.empty;
   globals = LidMap.empty;
+  names
 }
 
 (** Layouts and sizes. *)
 
 let builtin_layouts = [
-  "C_String_t", I32, A32;
-  "C_String_t_", I32, A32;
-  "C_Compat_String_t", I32, A32;
-  "C_Compat_String_t_", I32, A32;
-  "Prims_string", I32, A32;
-  "Prims_int", I32, A32; (* should remove *)
-  "clock_t", I32, A32;
-  "exit_code", I32, A32;
+  ([ "C"; "String" ], "t"), I32, A32;
+  ([ "C"; "String" ], "t_"), I32, A32;
+  ([ "C"; "Compat"; "String" ], "t"), I32, A32;
+  ([ "C"; "Compat"; "String" ], "t_"), I32, A32;
+  ([ "Prims" ], "string"), I32, A32;
+  ([ "Prims" ], "int"), I32, A32; (* should remove *)
+  ([ "C" ], "clock_t"), I32, A32;
+  ([ "C" ], "exit_code"), I32, A32;
 ]
 
 
@@ -264,7 +266,7 @@ let populate env files =
   ) env files in
   (* Fill in built-in layouts *)
   let env = List.fold_left (fun env (l, s, a_s) ->
-    { env with layouts = LidMap.add ([], l) (LBuiltin (s, a_s)) env.layouts }
+    { env with layouts = LidMap.add l (LBuiltin (s, a_s)) env.layouts }
   ) env builtin_layouts in
   (* Compute the layouts for struct types that have an lid. *)
   let env = List.fold_left (fun env (_, decls) ->
@@ -440,11 +442,16 @@ let write_static (env: env) (lid: lident) (e: expr): string * CFlat.expr list =
         ) fields
     | EString s ->
         write_le dst ofs Helpers.uint32 (Z.of_int (Hashtbl.hash s));
-        [ CF.BufWrite (CF.GetGlobal (snd lid), ofs, CF.StringLiteral s, A32) ]
+        let name = GlobalNames.to_c_name env.names lid in
+        [ CF.BufWrite (CF.GetGlobal name, ofs, CF.StringLiteral s, A32) ]
     | EQualified lid' ->
-        write_le dst ofs Helpers.uint32 (Z.of_int (Hashtbl.hash (snd lid')));
-        [ CF.BufWrite (CF.GetGlobal (snd lid), ofs, CF.GetGlobal (snd lid'), A32) ]
-    | EApp ({ node = EQualified ([], "LowStar_Monotonic_Buffer_mnull"); _ }, _) ->
+        let name = GlobalNames.to_c_name env.names lid in
+        let name' = GlobalNames.to_c_name env.names lid' in
+        (* This is to disable constant string initializers sharing -- we write a
+         * dummy value. *)
+        write_le dst ofs Helpers.uint32 (Z.of_int (Hashtbl.hash name'));
+        [ CF.BufWrite (CF.GetGlobal name, ofs, CF.GetGlobal name', A32) ]
+    | EApp ({ node = EQualified (["LowStar"; "Monotonic"; "Buffer"], "mnull"); _ }, _) ->
         write_le dst ofs Helpers.uint32 Z.zero;
         []
     | _ ->
@@ -545,7 +552,8 @@ and mk_addr env e =
       | TBuf _ -> ()
       | TQualified lid -> assert (is_lflat (LidMap.find lid env.layouts))
       | _ -> () end;
-      CF.GetGlobal (snd lid)
+      let name = GlobalNames.to_c_name env.names lid in
+      CF.GetGlobal name
   | EAbort _ ->
       mk_expr_no_locals env e
   | _ ->
@@ -599,7 +607,7 @@ and mk_expr (env: env) (locals: locals) (e: expr): locals * CF.expr =
 
   | EApp ({ node = EQualified ident; _ }, es) ->
       let locals, es = fold (mk_expr env) locals es in
-      locals, CF.CallFunc (Idents.string_of_lident ident, es)
+      locals, CF.CallFunc (GlobalNames.to_c_name env.names ident, es)
 
   | EApp _ ->
       failwith "unsupported application"
@@ -611,7 +619,7 @@ and mk_expr (env: env) (locals: locals) (e: expr): locals * CF.expr =
       locals, CF.Constant (K.UInt32, string_of_int (LidMap.find v env.enums))
 
   | EQualified v ->
-      locals, CF.GetGlobal (Idents.string_of_lident v)
+      locals, CF.GetGlobal (GlobalNames.to_c_name env.names v)
 
   | EBufCreate (l, e_init, e_len) ->
       if not (e_init.node = EAny) then
@@ -846,7 +854,7 @@ let mk_decl env (d: decl): env * CF.decl option =
       let ret = [ size_of env ret ] in
       let locals = List.rev locals in
       let args, locals = KList.split (List.length args) locals in
-      let name = Idents.string_of_lident name in
+      let name = GlobalNames.to_c_name env.names name in
       env, Some CF.(Function { name; args; ret; locals; body; public })
 
   | DType _ ->
@@ -866,11 +874,11 @@ let mk_decl env (d: decl): env * CF.decl option =
         env, None
       end else
         let env, body, post_init = mk_global env name body in
-        let name = Idents.string_of_lident name in
+        let name = GlobalNames.to_c_name env.names name in
         env, Some (CF.Global (name, size, body, post_init, public))
 
   | DExternal (_, _, lid, t, _) ->
-      let name = Idents.string_of_lident lid in
+      let name = GlobalNames.to_c_name env.names lid in
       match t with
       | TArrow _ ->
           let ret, args = Helpers.flatten_arrow t in
@@ -888,8 +896,8 @@ let mk_decl env (d: decl): env * CF.decl option =
 
 (* Definitions to be skipped because they have a built-in compilation scheme. *)
 let skip (lid: lident) =
-  let skip = [ "LowStar_Monotonic_Buffer_mnull"] in
-  List.mem (snd lid) skip
+  let skip = [[ "LowStar"; "Monotonic"; "Buffer" ], "mnull"] in
+  List.mem lid skip
 
 let mk_module env decls =
   let env, decls = List.fold_left (fun (env, decls) d ->
@@ -914,8 +922,8 @@ let mk_module env decls =
   ) (env, []) decls in
   env, List.rev decls
 
-let mk_files files =
-  let env = populate empty files in
+let mk_files files names =
+  let env = populate (empty names) files in
   if Options.debug "cflat" then
     debug_env env;
   let _, modules = List.fold_left (fun (env, ms) (name, decls) ->

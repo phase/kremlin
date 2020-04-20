@@ -114,6 +114,8 @@ The default is %s and the available warnings are:
       appears in the wrong position)
   20: right-hand side of short-circuiting boolean operator gives rise to
       let-bindings, rewriting to an if-then-else
+  21: cannot translate to macro
+  22: dropping declaration at ctypes bindings generation time
 
 The [-bundle] option takes an argument of the form Api=Pattern1,...,Patternn
 The Api= part is optional and Api is made up of a non-empty list of modules
@@ -287,6 +289,8 @@ Supported options:|}
     "-fc89", Arg.Set arg_c89, "  generate C89-compatible code (meta-option, see \
       above) + also disable variadic-length KRML_HOST_EPRINTF";
     "-flinux-ints", Arg.Set Options.linux_ints, " use Linux kernel int types";
+    "-fmicrosoft", Arg.Set Options.microsoft, " various Microsoft-specific \
+      tweaks";
     "", Arg.Unit (fun _ -> ()), " ";
 
     (* For developers *)
@@ -414,9 +418,12 @@ Supported options:|}
   end;
 
   (* Then, bring in the "default options" for each compiler. *)
+  let ccopts = !Options.ccopts in
+  Options.ccopts := [];
   Arg.parse_argv ~current:(ref 0)
     (Array.append [| Sys.argv.(0) |] (List.assoc !Options.cc (Options.default_options ())))
     spec anon_fun usage;
+  Options.ccopts := ccopts @ !Options.ccopts;
 
   (* Then refine that based on the user's preferences. *)
   if !arg_warn_error <> "" then
@@ -632,8 +639,7 @@ Supported options:|}
    * For instance, we compute dependencies now rather than have to deal with
    * potential name conflicts owing to global collisions after dropping the
    * prefix for static declarations. *)
-  let deps = AstToCStar.mk_deps files in
-  let files, c_name_map = Simplify.to_c_names files in
+  let c_name_map = Simplify.allocate_c_names files in
 
   if !Options.wasm && not (Options.debug "force-c") then
     (* Runtime support files first. *)
@@ -645,7 +651,7 @@ Supported options:|}
 
     (* The Wasm backend diverges here. We go to [CFlat] (an expression
      * language), then directly into the Wasm AST. *)
-    let files = AstToCFlat.mk_files files in
+    let files = AstToCFlat.mk_files files c_name_map in
     let files = List.filter (fun (_, decls) -> List.length decls > 0) files in
     tick_print true "AstToCFlat";
 
@@ -660,18 +666,18 @@ Supported options:|}
   else
     let _ = () in
     if KString.starts_with !Options.exe_name "lib" then
-      Output.write_def files;
+      Output.write_def c_name_map files;
 
     (* Translate to C*... *)
-    let files = AstToCStar.mk_files files ifdefs macros in
-    let files = List.map2 (fun (name, program) deps -> name, deps, program) files deps in
+    let file_of_map = Bundle.mk_file_of files in
+    let files = AstToCStar.mk_files files file_of_map c_name_map ifdefs macros in
     tick_print true "AstToCStar";
 
     let files = List.filter (fun (_, _, decls) -> List.length decls > 0) files in
 
     (* ... then to C *)
     let headers = CStarToC11.mk_headers c_name_map files in
-    let ml_files  = GenCtypes.mk_ocaml_bindings files c_name_map in
+    let ml_files  = GenCtypes.mk_ocaml_bindings files c_name_map file_of_map in
     let files = CStarToC11.mk_files c_name_map files in
     let files = List.filter (fun (_, _, decls) -> List.length decls > 0) files in
     tick_print true "CStarToC";
@@ -684,7 +690,7 @@ Supported options:|}
     flush stderr;
     let c_output = Output.write_c files in
     let h_output = Output.write_h headers in
-    let ml_files = GenCtypes.write_bindings ml_files in
+    GenCtypes.write_bindings ml_files;
     GenCtypes.write_gen_module ml_files;
     Output.write_makefile user_ccopts !c_files c_output h_output;
     tick_print true "PrettyPrinting";
@@ -696,6 +702,7 @@ Supported options:|}
       Printf.printf "KreMLin: wrote out .h files for %s\n" (String.concat ", " (List.map fst3 headers))
     end;
 
+    let ml_files = GenCtypes.file_list ml_files in
     if not (KList.is_empty !Options.ctypes) then
       Printf.printf "KreMLin: wrote out .ml files for %s\n" (String.concat ", " ml_files);
 

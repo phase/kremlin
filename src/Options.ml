@@ -14,7 +14,7 @@ let no_prefix: Bundle.pat list ref = ref Bundle.[
 let add_include: (string option * string) list ref = ref [ ]
 let add_include_tmh = ref false
 let add_early_include: (string option * string) list ref = ref [ ]
-let warn_error = ref "+1..2@3+4..8@9+10@11+12..18@19+20..21"
+let warn_error = ref "+1..2@3+4..8@9+10@11+12..18@19+20..22"
 let tmpdir = ref "."
 let includes: string list ref = ref []
 let verbose = ref false
@@ -53,6 +53,7 @@ let no_return_else = ref false
 type merge = No | Prefix | Aggressive
 let merge_variables = ref No
 let linux_ints = ref false
+let microsoft = ref false
 
 let extract_uints = ref false
 let builtin_uint128 = ref false

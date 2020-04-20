@@ -135,6 +135,8 @@ and defeat_Wparentheses op e prec =
       0
   | Or, Op2 (And, _, _) ->
       0
+  | (Lt | Lte | Gt | Gte), Op2 ((Add | Sub), _, _) when !Options.microsoft ->
+      0
   | _ ->
       prec
 
@@ -201,7 +203,12 @@ and p_expr' curr = function
   | Member _ | MemberP _ ->
       failwith "[p_expr']: not implemented"
   | Bool b ->
-      string (string_of_bool b)
+      if !Options.microsoft then
+        string (match b with
+        | false -> "FALSE"
+        | true -> "TRUE")
+      else
+        string (string_of_bool b)
   | CompoundLiteral (t, init) ->
       (* NOTE: always parenthesize compound literal no matter what, because GCC
        * parses an application of a function to a compound literal as an n-ary
@@ -382,6 +389,10 @@ let p_comments cs =
   separate_map hardline (fun c -> string ("/*\n" ^ c ^ "\n*/")) cs ^^
   if List.length cs > 0 then hardline else empty
 
+let p_microsoft_comments cs =
+  separate_map hardline (fun c -> string ("/*++\n" ^ c ^ "\n--*/")) cs ^^
+  if List.length cs > 0 then hardline else empty
+
 (* We require infinite width to force this to be rendered on a single line. We
  * then force the rendering of the subexpression on a single line as well. *)
 let macro name d: document =
@@ -410,13 +421,16 @@ let macro name d: document =
 
 let p_decl_or_function (df: declaration_or_function) =
   match df with
-  | Macro (name, def) ->
+  | Macro (comments, name, def) ->
       let name = String.uppercase name in
-      macro name (parens (p_expr def))
+      p_comments comments ^^ macro name (parens (p_expr def))
   | Decl (comments, d) ->
       p_comments comments ^^ group (p_declaration d ^^ semi)
   | Function (comments, d, stmt) ->
-      p_comments comments ^^ group (p_declaration d) ^/^ p_stmt stmt
+      if !Options.microsoft then
+        group (p_declaration d) ^/^ p_microsoft_comments comments ^^ p_stmt stmt
+      else
+        p_comments comments ^^ group (p_declaration d) ^/^ p_stmt stmt
   | Text s ->
       string s
 

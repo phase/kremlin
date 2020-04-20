@@ -28,14 +28,19 @@ open PrintAst.Ops
 open Helpers
 
 module C = Checker
-module StringSet = Set.Make(String)
+module LidSet = Set.Make(struct
+  type t = lident
+  let compare = compare
+end)
 
 type env = {
   location: loc list;
   names: ident list;
+  type_names: ident list;
+    (* type names which we never can shadow via a local, see NameCollision.test *)
   in_block: ident list;
-  ifdefs: StringSet.t;
-  macros: StringSet.t;
+  ifdefs: LidSet.t;
+  macros: LidSet.t;
 }
 
 let locate env loc =
@@ -43,10 +48,11 @@ let locate env loc =
 
 let empty: env = {
   names = [];
+  type_names = [];
   in_block = [];
   location = [];
-  ifdefs = StringSet.empty;
-  macros = StringSet.empty;
+  ifdefs = LidSet.empty;
+  macros = LidSet.empty;
 }
 
 let reset_block env = {
@@ -54,6 +60,7 @@ let reset_block env = {
 }
 
 let push env binder = CStar.{
+  type_names = env.type_names;
   names = binder.name :: env.names;
   in_block = binder.name :: env.in_block;
   location = env.location;
@@ -145,7 +152,8 @@ let ensure_fresh env name body cont =
     tricky_shadowing_see_comment_above tentative body 0 ||
     List.exists (fun cont -> tricky_shadowing_see_comment_above tentative (Some cont) 1) cont ||
     List.mem tentative env.in_block ||
-    !Options.no_shadow && List.mem tentative env.names)
+    !Options.no_shadow && List.mem tentative env.names ||
+    List.mem tentative env.type_names)
 
 
 (** AstToCStar performs a unit-to-void conversion.
@@ -181,6 +189,8 @@ type return_pos =
   | May
   | Must
 
+type binder_pos = Function | Local
+
 let string_of_return_pos = function
   | Not -> "Not"
   | May -> "May"
@@ -192,15 +202,14 @@ let rec mk_expr env in_stmt e =
   | EBound var ->
       CStar.Var (find env var)
   | EEnum lident ->
-      CStar.Qualified (string_of_lident lident)
+      CStar.Qualified lident
   | EQualified lident ->
-      let name = string_of_lident lident in
-      if StringSet.mem name env.ifdefs then
+      if LidSet.mem lident env.ifdefs then
         Warn.(maybe_fatal_error (KPrint.bsprintf "%a" Loc.ploc env.location, IfDef lident));
-      if StringSet.mem name env.macros then
-        CStar.Qualified (String.uppercase name)
+      if LidSet.mem lident env.macros then
+        CStar.Macro lident
       else
-        CStar.Qualified name
+        CStar.Qualified lident
   | EConstant c ->
       CStar.Constant c
   | EApp (e, es) ->
@@ -250,7 +259,7 @@ let rec mk_expr env in_stmt e =
   | EString s ->
       CStar.StringLiteral s
   | EFlat fields ->
-      let name = match e.typ with TQualified lid -> Some (string_of_lident lid) | _ -> None in
+      let name = match e.typ with TQualified lid -> Some lid | _ -> None in
       CStar.Struct (name, List.map (fun (name, expr) ->
         name, mk_expr env expr
       ) fields)
@@ -295,7 +304,7 @@ and mk_stmts env e ret_type =
 
     match e.node with
     | ELet (binder, e1, e2) ->
-        let env, binder = mk_and_push_binder env binder (Some e1) [ e2 ]
+        let env, binder = mk_and_push_binder env binder Local (Some e1) [ e2 ]
         and e1 = mk_expr env false e1 in
         let acc = CStar.Decl (binder, e1) :: acc in
         collect (env, acc) return_pos e2
@@ -342,7 +351,7 @@ and mk_stmts env e ret_type =
         (* Note: the arguments to mk_and_push_binder are solely for the purpose
          * of avoiding name collisions. *)
         let is_solo_assignment = binder.node.meta = Some MetaSequence in
-        let env', binder = mk_and_push_binder env binder (Some e1) [ e2; e3; e4 ] in
+        let env', binder = mk_and_push_binder env binder Local (Some e1) [ e2; e3; e4 ] in
         let e2 = mk_expr env' false e2 in
         let e3 = KList.last (mk_block env' Not e3) in
         let e4 = mk_block env' Not e4 in
@@ -463,7 +472,7 @@ and mk_stmts env e ret_type =
           List.map (fun (lid, e) ->
             (match lid with
             | SConstant k -> `Int k
-            | SEnum lid -> `Ident (string_of_lident lid)
+            | SEnum lid -> `Ident lid
             | _ -> failwith "impossible"),
             mk_block env return_pos e
           ) branches, default) :: acc
@@ -569,8 +578,8 @@ and mk_stmts env e ret_type =
 
   and mk_ifcond env e =
     match e.node with
-    | EQualified (_, name) when StringSet.mem name env.ifdefs ->
-        CStar.Qualified (String.uppercase name)
+    | EQualified name when LidSet.mem name env.ifdefs ->
+        CStar.Macro name
     | EApp ({ node = EOp ((K.And | K.Or) as o, K.Bool); _ }, [ e1; e2 ]) ->
         CStar.Call (CStar.Op (o, K.Bool), [ mk_ifcond env e1; mk_ifcond env e2 ])
     | _ ->
@@ -598,7 +607,7 @@ and mk_return_type env = function
   | TUnit ->
       CStar.Void
   | TQualified name ->
-      CStar.Qualified (string_of_lident name)
+      CStar.Qualified name
   | TBool ->
       CStar.Bool
   | TAny ->
@@ -627,14 +636,22 @@ and mk_type env = function
  * other. *)
 and mk_and_push_binders env binders =
   let env, acc = List.fold_left (fun (env, acc) binder ->
-    let env, binder = mk_and_push_binder env binder None [] in
+    let env, binder = mk_and_push_binder env binder Function None [] in
     env, binder :: acc
   ) (env, []) binders in
   env, List.rev acc
 
-and mk_and_push_binder env binder body cont =
+and mk_and_push_binder env binder pos body cont =
+  let name =
+    if !Options.microsoft then
+      match pos with
+      | Local -> GlobalNames.camel_case binder.node.name
+      | Function -> GlobalNames.pascal_case binder.node.name
+    else
+      binder.node.name
+  in
   let binder = {
-    CStar.name = ensure_fresh env binder.node.name body cont;
+    CStar.name = ensure_fresh env name body cont;
     typ = mk_type env binder.typ
   } in
   push env binder, binder
@@ -670,7 +687,7 @@ and mark_binders_const flags binders =
     { CStar.name; typ = mark_const (List.mem (Common.Const name) flags) typ }
   ) binders
 
-and mk_declaration env d: CStar.decl option =
+and mk_declaration m env d: (CStar.decl * _) option =
   let wrap_throw name (comp: CStar.decl Lazy.t) =
     try Lazy.force comp with
     | Error e ->
@@ -686,42 +703,39 @@ and mk_declaration env d: CStar.decl option =
       let env = locate env (InTop name) in
       Some (wrap_throw (string_of_lident name) (lazy begin
         let t = mk_return_type env t in
-        assert (env.names = []);
         let binders, body = a_unit_is_a_unit binders body in
         let env, binders = mk_and_push_binders env binders in
         let binders = mark_binders_const flags binders in
         let body = mk_function_block env body t in
-        CStar.Function (cc, flags, t, (string_of_lident name), binders, body)
-      end))
+        CStar.Function (cc, flags, t, name, binders, body)
+      end), [])
 
   | DGlobal (flags, name, n, t, body) ->
       assert (n = 0);
       let env = locate env (InTop name) in
-      let macro = StringSet.mem (string_of_lident name) env.macros in
+      let macro = LidSet.mem name env.macros in
       Some (CStar.Global (
-        string_of_lident name,
+        name,
         macro,
         flags,
         mk_type env t,
-        mk_expr env false body))
+        mk_expr env false body), [])
 
   | DExternal (cc, flags, name, t, pp) ->
-      if StringSet.mem (snd name) env.ifdefs then
+      if LidSet.mem name env.ifdefs then
         None
       else
         let add_cc = function
           | CStar.Function (_, t, ts) -> CStar.Function (cc, t, ts)
           | t -> t
         in
-        Some (CStar.External (string_of_lident name, add_cc (mk_type env t), flags, pp))
+        Some (CStar.External (name, add_cc (mk_type env t), flags, pp), [])
 
   | DType (name, flags, _, Forward) ->
-      let name = string_of_lident name in
-      Some (CStar.TypeForward (name, flags))
+      Some (CStar.TypeForward (name, flags), [ GlobalNames.to_c_name m name ])
 
   | DType (name, flags, 0, def) ->
-      let name = string_of_lident name in
-      Some (CStar.Type (name, mk_type_def env def, flags))
+      Some (CStar.Type (name, mk_type_def env def, flags), [ GlobalNames.to_c_name m name ] )
 
   | DType _ ->
       None
@@ -742,7 +756,7 @@ and mk_type_def env d: CStar.typ =
       failwith "Variant should've been desugared at this stage"
 
   | Enum tags ->
-      CStar.Enum (List.map string_of_lident tags)
+      CStar.Enum tags
 
   | Union fields ->
       CStar.Union (List.map (fun (f, t) ->
@@ -753,59 +767,58 @@ and mk_type_def env d: CStar.typ =
       failwith "impossible, handled by mk_declaration"
 
 
-and mk_program name env decls =
-  KList.filter_map (fun d ->
+and mk_program m name env decls =
+  let decls, _ = List.fold_left (fun (decls, names) d ->
     let n = string_of_lident (Ast.lid_of_decl d) in
-    try
-      mk_declaration env d
-    with
-    | Error e ->
+    match mk_declaration m { env with type_names = names } d with
+    | exception (Error e) ->
         Warn.maybe_fatal_error (fst e, Dropping (name ^ "/" ^ n, e));
-        None
-    | e ->
+        decls, names
+    | exception e ->
         Warn.fatal_error "Fatal failure in %a: %s\n"
           plid (Ast.lid_of_decl d)
           (Printexc.to_string e)
-  ) decls
+    | None ->
+        decls, names
+    | Some (decl, name) ->
+        decl :: decls, name @ names
+  ) ([], []) decls in
+  List.rev decls
 
-and mk_files files ifdefs macros =
+and mk_files files file_of m ifdefs macros =
   let env = { empty with ifdefs; macros } in
   List.map (fun file ->
+    let deps = 
+      Hashtbl.fold (fun k _ acc -> k :: acc) (Bundles.direct_dependencies file_of file) []
+    in
     let name, program = file in
-    name, mk_program name env program
-  ) files
-
-let mk_deps files =
-  (* Construct the mapping needed to get direct dependencies *)
-  let file_of = Bundle.mk_file_of files in
-  List.map (fun file ->
-    Hashtbl.fold (fun k _ acc -> k :: acc) (Bundles.direct_dependencies file_of file) []
+    name, deps, mk_program m name env program
   ) files
 
 let mk_macros_set files =
   (object
     inherit [_] reduce
-    method private zero = StringSet.empty
-    method private plus = StringSet.union
+    method private zero = LidSet.empty
+    method private plus = LidSet.union
     method visit_DGlobal _ flags name _ _ body =
       if List.mem Common.Macro flags then
         if body.node = EAny then begin
           Warn.(maybe_fatal_error ("", CannotMacro name));
-          StringSet.empty
+          LidSet.empty
         end else
-          StringSet.singleton (Simplify.target_c_name name false)
+          LidSet.singleton name
       else
-        StringSet.empty
+        LidSet.empty
   end)#visit_files () files
 
 let mk_ifdefs_set files =
   (object
     inherit [_] reduce
-    method private zero = StringSet.empty
-    method private plus = StringSet.union
+    method private zero = LidSet.empty
+    method private plus = LidSet.union
     method visit_DExternal _ _ flags name _ _ =
       if List.mem Common.IfDef flags then
-        StringSet.singleton (Simplify.target_c_name name false)
+        LidSet.singleton name
       else
-        StringSet.empty
+        LidSet.empty
   end)#visit_files () files

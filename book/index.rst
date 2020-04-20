@@ -11,8 +11,13 @@ The KreMLin user manual and documentation
    :caption: Contents:
 
    Introduction
-   LowStar
-   RingBuffer
+   Setup
+   Core
+   TocLibraries
+   TocExamples
+   Toy
+   AdvancedTips
+   AdvancedTopics
 
 
 Indices and tables
